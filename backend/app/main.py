@@ -100,6 +100,19 @@ class GameService:
             record = db.query(GameSession).filter(GameSession.status.in_(["lobby", "running", "complete"])).order_by(GameSession.created_at.desc()).first()
             return record.id if record else None
 
+    async def load_active_sessions(self) -> int:
+        """Rehydrate all live sessions into the in-memory cache after a (re)start.
+
+        The timer loop only advances sessions present in ``self.states``; without this a hand
+        left in progress by a crash or redeploy would keep its persisted state but never have
+        its turn timer resumed until a client happened to reconnect and trigger ``get()``.
+        """
+        with SessionLocal() as db:
+            records = db.query(GameSession).filter(GameSession.status.in_(["lobby", "running", "complete"])).all()
+            for record in records:
+                self.states[record.id] = record.game_state
+            return len(records)
+
     async def close(self, session_id: str) -> None:
         state = await self.get(session_id)
         state["status"] = "closed"
@@ -143,6 +156,9 @@ async def startup() -> None:
     except Exception as exc:
         # The database remains the durable source of truth. Redis is a fast live-state cache.
         print(f"Redis unavailable; continuing without live cache: {exc}")
+    resumed = await service.load_active_sessions()
+    if resumed:
+        print(f"Resumed {resumed} active session(s) from durable storage.")
     asyncio.create_task(timer_loop())
 
 
@@ -205,7 +221,8 @@ async def public_session_history(session_id: str, x_player_token: str | None = H
 async def close_session(session_id: str, x_host_token: str | None = Header(default=None)) -> dict:
     if not await service.is_host(session_id, x_host_token):
         raise HTTPException(status_code=401, detail="Host authorization required.")
-    await service.close(session_id)
+    async with service.lock:
+        await service.close(session_id)
     return {"ok": True}
 
 
@@ -222,13 +239,14 @@ async def disconnect(sid: str) -> None:
     same_player_elsewhere = any(c.get("playerId") == context["playerId"] and c.get("sessionId") == context["sessionId"] for c in contexts.values())
     if not same_player_elsewhere:
         try:
-            state = await service.get(context["sessionId"])
-            player = player_by_id(state, context["playerId"])
-            if player:
-                player["connected"] = False
-                state["version"] += 1
-                await service.save(context["sessionId"], "player_disconnected", {"playerId": player["id"]})
-                await emit_table(context["sessionId"])
+            async with service.lock:
+                state = await service.get(context["sessionId"])
+                player = player_by_id(state, context["playerId"])
+                if player:
+                    player["connected"] = False
+                    state["version"] += 1
+                    await service.save(context["sessionId"], "player_disconnected", {"playerId": player["id"]})
+                    await emit_table(context["sessionId"])
         except GameError:
             pass
 
@@ -239,30 +257,31 @@ async def join_room(sid: str, data: dict) -> None:
     reconnect = read_token(str(data.get("reconnectToken", "")))
     is_reconnect = bool(reconnect and reconnect.get("kind") == "player" and reconnect.get("session") == session_id)
     try:
-        state = await service.get(session_id)
-        host_token = data.get("hostToken")
-        is_host = await service.is_host(session_id, host_token)
-        player_id = reconnect.get("player") if is_reconnect else None
-        if player_id and not player_by_id(state, player_id):
-            player_id = None
-            is_reconnect = False
-        if not is_reconnect and not is_host:
-            if not await service.passcode_ok(session_id, str(data.get("passcode", ""))):
-                raise GameError("Incorrect room passcode.")
-        if not player_id:
-            player_id = secrets.token_urlsafe(9)
-            token = issue_token({"kind": "player", "session": session_id, "player": player_id}, expires_in=86_400)
-        else:
-            token = str(data.get("reconnectToken"))
-            player = player_by_id(state, player_id)
-            player["connected"] = True
-            await service.save(session_id, "player_reconnected", {"playerId": player_id})
-        contexts[sid] = {"sessionId": session_id, "playerId": player_id, "isHost": is_host}
-        await sio.enter_room(sid, session_id)
-        await sio.emit("joined", {"playerId": player_id, "reconnectToken": token, "isHost": is_host}, to=sid)
-        await sio.emit("table_snapshot", public_view(state, player_id, is_host), to=sid)
-        if is_reconnect:
-            await emit_table(session_id)
+        async with service.lock:
+            state = await service.get(session_id)
+            host_token = data.get("hostToken")
+            is_host = await service.is_host(session_id, host_token)
+            player_id = reconnect.get("player") if is_reconnect else None
+            if player_id and not player_by_id(state, player_id):
+                player_id = None
+                is_reconnect = False
+            if not is_reconnect and not is_host:
+                if not await service.passcode_ok(session_id, str(data.get("passcode", ""))):
+                    raise GameError("Incorrect room passcode.")
+            if not player_id:
+                player_id = secrets.token_urlsafe(9)
+                token = issue_token({"kind": "player", "session": session_id, "player": player_id}, expires_in=86_400)
+            else:
+                token = str(data.get("reconnectToken"))
+                player = player_by_id(state, player_id)
+                player["connected"] = True
+                await service.save(session_id, "player_reconnected", {"playerId": player_id})
+            contexts[sid] = {"sessionId": session_id, "playerId": player_id, "isHost": is_host}
+            await sio.enter_room(sid, session_id)
+            await sio.emit("joined", {"playerId": player_id, "reconnectToken": token, "isHost": is_host}, to=sid)
+            await sio.emit("table_snapshot", public_view(state, player_id, is_host), to=sid)
+            if is_reconnect:
+                await emit_table(session_id)
     except GameError as exc:
         await emit_error(sid, str(exc))
 
@@ -271,13 +290,14 @@ async def join_room(sid: str, data: dict) -> None:
 async def choose_seat(sid: str, data: dict) -> None:
     try:
         context = contexts[sid]
-        state = await service.get(context["sessionId"])
-        name = str(data.get("name", "")).strip()
-        if not name:
-            raise GameError("Enter a display name.")
-        seat_player(state, context["playerId"], name, int(data.get("seat")))
-        await service.save(context["sessionId"], "player_seated", {"playerId": context["playerId"], "seat": int(data["seat"]), "name": name})
-        await emit_table(context["sessionId"])
+        async with service.lock:
+            state = await service.get(context["sessionId"])
+            name = str(data.get("name", "")).strip()
+            if not name:
+                raise GameError("Enter a display name.")
+            seat_player(state, context["playerId"], name, int(data.get("seat")))
+            await service.save(context["sessionId"], "player_seated", {"playerId": context["playerId"], "seat": int(data["seat"]), "name": name})
+            await emit_table(context["sessionId"])
     except (GameError, KeyError, ValueError, TypeError) as exc:
         await emit_error(sid, str(exc))
 
@@ -286,10 +306,11 @@ async def choose_seat(sid: str, data: dict) -> None:
 async def ready(sid: str, data: dict) -> None:
     try:
         context = contexts[sid]
-        state = await service.get(context["sessionId"])
-        set_ready(state, context["playerId"], bool(data.get("ready", True)))
-        await service.save(context["sessionId"], "player_ready", {"playerId": context["playerId"], "ready": bool(data.get("ready", True))})
-        await emit_table(context["sessionId"])
+        async with service.lock:
+            state = await service.get(context["sessionId"])
+            set_ready(state, context["playerId"], bool(data.get("ready", True)))
+            await service.save(context["sessionId"], "player_ready", {"playerId": context["playerId"], "ready": bool(data.get("ready", True))})
+            await emit_table(context["sessionId"])
     except (GameError, KeyError) as exc:
         await emit_error(sid, str(exc))
 
@@ -298,10 +319,11 @@ async def ready(sid: str, data: dict) -> None:
 async def start(sid: str) -> None:
     try:
         context = require_host(sid)
-        state = await service.get(context["sessionId"])
-        start_hand(state)
-        await service.save(context["sessionId"], "hand_started", {"handNumber": state["handNumber"]})
-        await emit_table(context["sessionId"])
+        async with service.lock:
+            state = await service.get(context["sessionId"])
+            start_hand(state)
+            await service.save(context["sessionId"], "hand_started", {"handNumber": state["handNumber"]})
+            await emit_table(context["sessionId"])
     except (GameError, KeyError) as exc:
         await emit_error(sid, str(exc))
 
@@ -310,12 +332,13 @@ async def start(sid: str) -> None:
 async def player_action(sid: str, data: dict) -> None:
     try:
         context = contexts[sid]
-        state = await service.get(context["sessionId"])
-        act(state, context["playerId"], str(data.get("action")), data.get("amount"))
-        await service.save(context["sessionId"], "player_action", {"playerId": context["playerId"], "action": data.get("action"), "amount": data.get("amount")})
-        if state["status"] == "complete":
-            await service.save(context["sessionId"], "hand_completed", completed_hand_payload(state))
-        await emit_table(context["sessionId"])
+        async with service.lock:
+            state = await service.get(context["sessionId"])
+            act(state, context["playerId"], str(data.get("action")), data.get("amount"))
+            await service.save(context["sessionId"], "player_action", {"playerId": context["playerId"], "action": data.get("action"), "amount": data.get("amount")})
+            if state["status"] == "complete":
+                await service.save(context["sessionId"], "hand_completed", completed_hand_payload(state))
+            await emit_table(context["sessionId"])
     except (GameError, KeyError, TypeError, ValueError) as exc:
         await emit_error(sid, str(exc))
 
@@ -324,10 +347,11 @@ async def player_action(sid: str, data: dict) -> None:
 async def rebuy_request(sid: str) -> None:
     try:
         context = contexts[sid]
-        state = await service.get(context["sessionId"])
-        request_rebuy(state, context["playerId"])
-        await service.save(context["sessionId"], "rebuy_requested", {"playerId": context["playerId"]})
-        await emit_table(context["sessionId"])
+        async with service.lock:
+            state = await service.get(context["sessionId"])
+            request_rebuy(state, context["playerId"])
+            await service.save(context["sessionId"], "rebuy_requested", {"playerId": context["playerId"]})
+            await emit_table(context["sessionId"])
     except (GameError, KeyError) as exc:
         await emit_error(sid, str(exc))
 
@@ -336,11 +360,12 @@ async def rebuy_request(sid: str) -> None:
 async def rebuy_approve(sid: str, data: dict) -> None:
     try:
         context = require_host(sid)
-        state = await service.get(context["sessionId"])
-        player_id = str(data.get("playerId"))
-        amount = approve_rebuy(state, player_id)
-        await service.save(context["sessionId"], "rebuy_approved", {"playerId": player_id, "amount": amount})
-        await emit_table(context["sessionId"])
+        async with service.lock:
+            state = await service.get(context["sessionId"])
+            player_id = str(data.get("playerId"))
+            amount = approve_rebuy(state, player_id)
+            await service.save(context["sessionId"], "rebuy_approved", {"playerId": player_id, "amount": amount})
+            await emit_table(context["sessionId"])
     except (GameError, KeyError) as exc:
         await emit_error(sid, str(exc))
 
@@ -349,10 +374,11 @@ async def rebuy_approve(sid: str, data: dict) -> None:
 async def cashout(sid: str) -> None:
     try:
         context = contexts[sid]
-        state = await service.get(context["sessionId"])
-        amount = request_cashout(state, context["playerId"])
-        await service.save(context["sessionId"], "cashout_requested", {"playerId": context["playerId"], "amount": amount})
-        await emit_table(context["sessionId"])
+        async with service.lock:
+            state = await service.get(context["sessionId"])
+            amount = request_cashout(state, context["playerId"])
+            await service.save(context["sessionId"], "cashout_requested", {"playerId": context["playerId"], "amount": amount})
+            await emit_table(context["sessionId"])
     except (GameError, KeyError) as exc:
         await emit_error(sid, str(exc))
 

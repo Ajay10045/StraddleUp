@@ -2,14 +2,14 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { io, Socket } from "socket.io-client";
 import "./styles.css";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 declare global {
   interface HTMLElement { __straddleupRoot?: ReturnType<typeof createRoot>; }
 }
 
 type Player = { id: string; name: string; seat: number; stack: number; status: string; connected: boolean; ready: boolean; inHand: boolean; folded: boolean; allIn: boolean; holeCards: string[]; rebuyRequested?: boolean; leaveAfterHand?: boolean; cashoutAmount?: number };
-type TableState = { sessionId: string; version: number; status: string; config: { smallBlind: number; bigBlind: number; buyIn: number; maxSeats: number; timeoutSeconds: number; autoNextHandSeconds: number }; players: Player[]; buttonSeat: number | null; handNumber: number; turnDeadline: number | null; nextHandAt: number | null; hand: null | { street: string; board: string[]; smallBlindSeat: number; bigBlindSeat: number; actorSeat: number | null; pot: number; currentBet: number }; lastResult: null | { type: string; board: string[]; pots: { amount: number; winners: string[]; handClass?: string }[] }; legalActions: Record<string, any>; viewerId: string; isHost: boolean };
+type TableState = { sessionId: string; version: number; status: string; config: { smallBlind: number; bigBlind: number; buyIn: number; maxSeats: number; timeoutSeconds: number; autoNextHandSeconds: number }; players: Player[]; buttonSeat: number | null; handNumber: number; turnDeadline: number | null; nextHandAt: number | null; hand: null | { street: string; board: string[]; smallBlindSeat: number; bigBlindSeat: number; actorSeat: number | null; pot: number; currentBet: number }; lastResult: null | { type: string; board: string[]; pots: { amount: number; winners: string[]; handClass?: string }[] }; legalActions: Record<string, any>; viewerId: string; isHost: boolean; serverTime: number };
 
 const socket: Socket = io({ autoConnect: true, transports: ["websocket", "polling"] });
 
@@ -24,6 +24,10 @@ function App() {
   const [playerId, setPlayerId] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [message, setMessage] = useState("");
+  // clockOffset = serverTime - client Date.now() at the moment a snapshot arrived; added to the
+  // local clock so countdowns track the server's deadlines despite client clock drift.
+  const [clockOffset, setClockOffset] = useState(0);
+  const lastVersion = useRef(-1);
 
   useEffect(() => {
     if (sessionId) {
@@ -38,7 +42,16 @@ function App() {
   }, [sessionId]);
 
   useEffect(() => {
-    socket.on("table_snapshot", (next: TableState) => setState(next));
+    // New session (or re-subscribe): forget the previous session's version watermark.
+    lastVersion.current = -1;
+    socket.on("table_snapshot", (next: TableState) => {
+      // Transport upgrades/reconnects can deliver snapshots out of order; the server stamps a
+      // monotonic `version`, so ignore any snapshot that isn't newer than the last one applied.
+      if (typeof next.version === "number" && next.version < lastVersion.current) return;
+      lastVersion.current = next.version;
+      if (typeof next.serverTime === "number") setClockOffset(next.serverTime - Date.now());
+      setState(next);
+    });
     socket.on("joined", (data: { playerId: string; reconnectToken: string }) => {
       setPlayerId(data.playerId);
       if (sessionId) localStorage.setItem(storageKey(sessionId), data.reconnectToken);
@@ -46,6 +59,20 @@ function App() {
     socket.on("action_rejected", (data: { message: string }) => setMessage(data.message));
     socket.on("connect", () => setMessage(""));
     return () => { socket.off("table_snapshot"); socket.off("joined"); socket.off("action_rejected"); socket.off("connect"); };
+  }, [sessionId]);
+
+  useEffect(() => {
+    // Silently restore an existing seat on page refresh or socket reconnect. The server accepts a
+    // reconnect token (or host token) without re-asking for name/passcode, so a returning player or
+    // host skips the join form entirely. Brand-new visitors have neither token and still see it.
+    if (!sessionId) return;
+    const reconnectToken = localStorage.getItem(storageKey(sessionId));
+    const savedHost = params.get("host") || localStorage.getItem(`straddleup:${sessionId}:host`) || "";
+    if (!reconnectToken && !savedHost) return;
+    const rejoin = () => socket.emit("join_room", { sessionId, reconnectToken, hostToken: savedHost });
+    if (socket.connected) rejoin();
+    socket.on("connect", rejoin);
+    return () => { socket.off("connect", rejoin); };
   }, [sessionId]);
 
   const create = async (form: Record<string, string>) => {
@@ -60,7 +87,13 @@ function App() {
   const join = (name: string, passcode: string) => { setDisplayName(name); socket.emit("join_room", { sessionId, passcode, hostToken, reconnectToken: localStorage.getItem(storageKey(sessionId)), name }); };
   if (findingTable) return <main className="landing"><section className="panel join"><p className="eyebrow">STRADDLEUP</p><h2>Finding the private table…</h2></section></main>;
   if (!sessionId) return <HostSetup onCreate={create} message={message} />;
-  if (!state || !playerId) return <JoinRoom onJoin={join} sessionId={sessionId} message={message} host={Boolean(hostToken)} />;
+  // A stored token means we're silently restoring a seat — show reconnecting, not the join form,
+  // so a refresh mid-game doesn't flash the name/passcode screen while the rejoin is in flight.
+  const hasStoredIdentity = sessionId && (localStorage.getItem(storageKey(sessionId)) || hostToken);
+  if (!state || !playerId) {
+    if (hasStoredIdentity && !message) return <main className="landing"><section className="panel join"><p className="eyebrow">STRADDLEUP</p><h2>Reconnecting to your seat…</h2></section></main>;
+    return <JoinRoom onJoin={join} sessionId={sessionId} message={message} host={Boolean(hostToken)} />;
+  }
   const me = state.players.find(p => p.id === state.viewerId);
   if (!me || me.status !== "seated") return <SeatPicker state={state} initialName={displayName} onChoose={(name, seat) => socket.emit("choose_seat", { name, seat })} message={message} />;
   const history = async () => {
@@ -74,7 +107,7 @@ function App() {
     localStorage.removeItem(`straddleup:${sessionId}:host`);
     window.location.assign("/");
   };
-  return <PokerTable state={state} me={me} message={message} onAction={(action, amount?) => socket.emit("player_action", { action, amount })} onStart={() => socket.emit("start_hand")} onReady={() => socket.emit("set_ready", { ready: !me.ready })} onRebuy={() => socket.emit("request_rebuy")} onCashout={() => socket.emit("request_cashout")} onApprove={(id) => socket.emit("host_approve_rebuy", { playerId: id })} onHistory={history} onClose={close} />;
+  return <PokerTable state={state} me={me} message={message} clockOffset={clockOffset} onAction={(action, amount?) => socket.emit("player_action", { action, amount })} onStart={() => socket.emit("start_hand")} onReady={() => socket.emit("set_ready", { ready: !me.ready })} onRebuy={() => socket.emit("request_rebuy")} onCashout={() => socket.emit("request_cashout")} onApprove={(id) => socket.emit("host_approve_rebuy", { playerId: id })} onHistory={history} onClose={close} />;
 }
 
 function HostSetup({ onCreate, message }: { onCreate: (form: Record<string, string>) => void; message: string }) {
@@ -95,18 +128,33 @@ function SeatPicker({ state, initialName, onChoose, message }: { state: TableSta
   return <main className="landing"><section className="panel join"><p className="eyebrow">TABLE LOBBY</p><h2>Choose your seat</h2><label>Display name<input required value={name} onChange={e => setName(e.target.value)} placeholder="Your poker name" /></label><div className="seats">{Array.from({ length: state.config.maxSeats }, (_, seat) => { const occupant = state.players.find(p => p.seat === seat && p.status === "seated"); return <button key={seat} disabled={Boolean(occupant) || !name.trim()} onClick={() => onChoose(name, seat)} className="seat-choice">{occupant ? `${occupant.name} · occupied` : `Seat ${seat + 1}`}</button>; })}</div>{message && <p className="error">{message}</p>}</section></main>;
 }
 
-function PokerTable({ state, me, message, onAction, onStart, onReady, onRebuy, onCashout, onApprove, onHistory, onClose }: { state: TableState; me: Player; message: string; onAction: (action: string, amount?: number) => void; onStart: () => void; onReady: () => void; onRebuy: () => void; onCashout: () => void; onApprove: (id: string) => void; onHistory: () => Promise<{ kind: string; payload: any; at: string }[]>; onClose: () => Promise<void> }) {
+function PokerTable({ state, me, message, clockOffset, onAction, onStart, onReady, onRebuy, onCashout, onApprove, onHistory, onClose }: { state: TableState; me: Player; message: string; clockOffset: number; onAction: (action: string, amount?: number) => void; onStart: () => void; onReady: () => void; onRebuy: () => void; onCashout: () => void; onApprove: (id: string) => void; onHistory: () => Promise<{ kind: string; payload: any; at: string }[]>; onClose: () => Promise<void> }) {
   const [raiseTo, setRaiseTo] = useState(0);
   const [remaining, setRemaining] = useState(0);
   const [nextHandRemaining, setNextHandRemaining] = useState(0);
   const [history, setHistory] = useState<{ kind: string; payload: any; at: string }[] | null>(null);
   const [stackMode, setStackMode] = useState<"amount" | "blinds">(() => localStorage.getItem("straddleup:stack-mode") === "blinds" ? "blinds" : "amount");
-  useEffect(() => { const tick = () => { const now = Date.now(); setRemaining(Math.max(0, Math.ceil(((state.turnDeadline || 0) - now) / 1000))); setNextHandRemaining(Math.max(0, Math.ceil(((state.nextHandAt || 0) - now) / 1000))); }; tick(); const id = window.setInterval(tick, 250); return () => clearInterval(id); }, [state.turnDeadline, state.nextHandAt]);
+  const [invite, setInvite] = useState<"idle" | "copied" | "manual">("idle");
+  // A join link is just this app's URL scoped to the table; an opener with a table already
+  // active is routed to the Join page to enter the passcode. Never embed the passcode here.
+  const inviteLink = `${window.location.origin}/?session=${state.sessionId}`;
+  const onInvite = async () => {
+    try {
+      await navigator.clipboard.writeText(inviteLink);
+      setInvite("copied");
+      window.setTimeout(() => setInvite("idle"), 2500);
+    } catch {
+      // Clipboard blocked (non-HTTPS origin, permissions) — reveal the link to copy by hand.
+      setInvite("manual");
+    }
+  };
+  useEffect(() => { const tick = () => { const now = Date.now() + clockOffset; setRemaining(Math.max(0, Math.ceil(((state.turnDeadline || 0) - now) / 1000))); setNextHandRemaining(Math.max(0, Math.ceil(((state.nextHandAt || 0) - now) / 1000))); }; tick(); const id = window.setInterval(tick, 250); return () => clearInterval(id); }, [state.turnDeadline, state.nextHandAt, clockOffset]);
   useEffect(() => { setRaiseTo(state.legalActions?.minRaiseTo || 0); }, [state.legalActions?.minRaiseTo]);
   const current = state.hand?.actorSeat === me.seat;
   const actions = state.legalActions || {};
   const player = (seat: number) => state.players.find(p => p.seat === seat && p.status === "seated");
-  return <main className="table-shell"><header><div className="brand">Straddle<span>Up</span><small>Private Table</small></div><div className="header-meta">{state.config.smallBlind}/{state.config.bigBlind} · Buy-in {state.config.buyIn}<span className={socket.connected ? "online" : "offline"}>{socket.connected ? "● Live" : "● Reconnecting"}</span></div></header>
+  return <main className="table-shell"><header><div className="brand">Straddle<span>Up</span><small>Private Table</small></div><div className="header-meta">{state.config.smallBlind}/{state.config.bigBlind} · Buy-in {state.config.buyIn}<span className={socket.connected ? "online" : "offline"}>{socket.connected ? "● Live" : "● Reconnecting"}</span></div><button className="ghost invite" onClick={onInvite}>{invite === "copied" ? "Link copied ✓" : "Invite"}</button></header>
+    {invite === "manual" && <div className="invite-manual">Share this link (they’ll need the passcode):<input readOnly aria-label="Invite link" value={inviteLink} onFocus={e => e.target.select()} /></div>}
     {message && <p className="toast error">{message}</p>}<section className="poker-table"><div className="felt"><div className="table-label">{state.status === "running" ? state.hand?.street : state.status === "complete" ? "HAND COMPLETE" : "WAITING FOR PLAYERS"}</div><div className="board">{(state.hand?.board || state.lastResult?.board || []).map((card, i) => <Card key={i} card={card} />)}</div><div className="pot">POT <strong>{state.hand?.pot || 0}</strong></div></div>
       {Array.from({ length: state.config.maxSeats }, (_, seat) => <Seat key={seat} seat={seat} player={player(seat)} active={state.hand?.actorSeat === seat} button={state.buttonSeat === seat} smallBlind={state.hand?.smallBlindSeat === seat} bigBlind={state.hand?.bigBlindSeat === seat} remaining={state.hand?.actorSeat === seat ? remaining : 0} stackMode={stackMode} bigBlindValue={state.config.bigBlind} />)}
     </section>

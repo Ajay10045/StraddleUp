@@ -409,4 +409,7 @@ def public_view(state: dict, viewer_id: str | None = None, is_host: bool = False
     view["legalActions"] = legal_actions(state, viewer_id) if viewer_id else {}
     view["viewerId"] = viewer_id
     view["isHost"] = is_host
+    # Server clock at emit time (epoch ms). turnDeadline/nextHandAt are server-relative, so the
+    # client uses this to correct for client-vs-server clock drift instead of its own Date.now().
+    view["serverTime"] = int(time.time() * 1000)
     return view

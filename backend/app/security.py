@@ -21,8 +21,17 @@ def verify_passcode(passcode: str, encoded: str) -> bool:
     return hmac.compare_digest(actual, expected)
 
 
+_INSECURE_SECRETS = {"local-development-secret-change-me", "change-me-before-sharing", "replace-with-a-long-random-secret", ""}
+
+
 def _secret() -> bytes:
-    return os.getenv("APP_SECRET", "local-development-secret-change-me").encode()
+    secret = os.getenv("APP_SECRET", "")
+    if secret.strip() in _INSECURE_SECRETS:
+        raise RuntimeError(
+            "APP_SECRET is unset or using a known placeholder value. Set APP_SECRET to a long "
+            "random secret before starting the server; it signs host and player tokens."
+        )
+    return secret.encode()
 
 
 def issue_token(payload: dict[str, Any], expires_in: int = 43_200) -> str:
