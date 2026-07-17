@@ -6,3 +6,4 @@ psycopg[binary]==3.2.13
 redis==5.2.1
 treys==0.1.8
 pytest==8.3.4
+pytest-asyncio==0.24.0

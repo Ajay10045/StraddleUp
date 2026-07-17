@@ -9,7 +9,7 @@ declare global {
 }
 
 type Player = { id: string; name: string; seat: number; stack: number; status: string; connected: boolean; ready: boolean; inHand: boolean; folded: boolean; allIn: boolean; holeCards: string[]; rebuyRequested?: boolean; leaveAfterHand?: boolean; cashoutAmount?: number; sittingOut?: boolean; sitOutNextHand?: boolean; straddleNextHand?: boolean; timeBankRemaining?: number };
-type TableState = { sessionId: string; version: number; status: string; config: { smallBlind: number; bigBlind: number; buyIn: number; maxSeats: number; timeoutSeconds: number; autoNextHandSeconds: number; sessionMinutes: number; timeBankSeconds: number }; players: Player[]; buttonSeat: number | null; handNumber: number; sessionStartedAt: number | null; sessionEndsAt: number | null; timeExtensionProposal?: { minutes: number; votes: Record<string, boolean>; voters: string[] } | null; settlement?: { playerId: string; name: string; boughtIn: number; chipsOut: number; net: number; status: string }[]; chat?: { id: string; playerId: string; name: string; text: string; kind?: string; at: number }[]; turnDeadline: number | null; nextHandAt: number | null; hand: null | { id: string; street: string; board: string[]; smallBlindSeat: number; bigBlindSeat: number; straddleSeat?: number | null; actorSeat: number | null; pot: number; currentBet: number; actions?: { type: string }[] }; lastResult: null | { type: string; board: string[]; pots: { amount: number; winners: string[]; handClass?: string; winnerHands?: { playerId: string; description: string }[] }[] }; legalActions: Record<string, any>; viewerId: string; isHost: boolean };
+type TableState = { sessionId: string; version: number; status: string; config: { smallBlind: number; bigBlind: number; buyIn: number; maxSeats: number; timeoutSeconds: number; autoNextHandSeconds: number; sessionMinutes: number; timeBankSeconds: number }; players: Player[]; buttonSeat: number | null; handNumber: number; sessionStartedAt: number | null; sessionEndsAt: number | null; timeExtensionProposal?: { minutes: number; votes: Record<string, boolean>; voters: string[] } | null; settlement?: { playerId: string; name: string; boughtIn: number; chipsOut: number; net: number; status: string }[]; chat?: { id: string; playerId: string; name: string; text: string; kind?: string; at: number }[]; turnDeadline: number | null; nextHandAt: number | null; hand: null | { id: string; street: string; board: string[]; smallBlindSeat: number; bigBlindSeat: number; straddleSeat?: number | null; actorSeat: number | null; pot: number; currentBet: number; actions?: { type: string }[] }; lastResult: null | { type: string; board: string[]; pots: { amount: number; winners: string[]; handClass?: string; winnerHands?: { playerId: string; description: string }[] }[] }; legalActions: Record<string, any>; viewerId: string; isHost: boolean; serverTime: number };
 
 const socket: Socket = io({ autoConnect: true, transports: ["websocket", "polling"] });
 
@@ -38,6 +38,10 @@ function App() {
   const [playerId, setPlayerId] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [message, setMessage] = useState("");
+  // clockOffset = serverTime - client Date.now() at the moment a snapshot arrived; added to the
+  // local clock so countdowns track the server's deadlines despite client clock drift.
+  const [clockOffset, setClockOffset] = useState(0);
+  const lastVersion = useRef(-1);
 
   useEffect(() => {
     if (sessionId) {
@@ -46,7 +50,16 @@ function App() {
   }, [sessionId]);
 
   useEffect(() => {
-    socket.on("table_snapshot", (next: TableState) => setState(next));
+    // New session (or re-subscribe): forget the previous session's version watermark.
+    lastVersion.current = -1;
+    socket.on("table_snapshot", (next: TableState) => {
+      // Transport upgrades/reconnects can deliver snapshots out of order; the server stamps a
+      // monotonic `version`, so ignore any snapshot that isn't newer than the last one applied.
+      if (typeof next.version === "number" && next.version < lastVersion.current) return;
+      lastVersion.current = next.version;
+      if (typeof next.serverTime === "number") setClockOffset(next.serverTime - Date.now());
+      setState(next);
+    });
     socket.on("joined", (data: { playerId: string; reconnectToken: string }) => {
       setPlayerId(data.playerId);
       if (sessionId) localStorage.setItem(storageKey(sessionId), data.reconnectToken);
@@ -65,7 +78,13 @@ function App() {
 
   const join = (name: string, passcode: string) => { setDisplayName(name); socket.emit("join_room", { sessionId, passcode, hostToken, reconnectToken: localStorage.getItem(storageKey(sessionId)), name }); };
   if (!sessionId) return <HostPortal />;
-  if (!state || !playerId) return <JoinRoom onJoin={join} sessionId={sessionId} message={message} host={Boolean(hostToken)} invitePasscode={invitePasscode} />;
+  // A stored token means the effect above is silently restoring our seat — show reconnecting, not
+  // the join form, so a refresh mid-game doesn't flash the name/passcode screen while it's in flight.
+  const hasStoredIdentity = Boolean(sessionId && (localStorage.getItem(storageKey(sessionId)) || hostToken));
+  if (!state || !playerId) {
+    if (hasStoredIdentity && !message) return <main className="landing"><section className="panel join"><p className="eyebrow">STRADDLEUP</p><h2>Reconnecting to your seat…</h2></section></main>;
+    return <JoinRoom onJoin={join} sessionId={sessionId} message={message} host={Boolean(hostToken)} invitePasscode={invitePasscode} />;
+  }
   const me = state.players.find(p => p.id === state.viewerId);
   if (!me) return <SeatPicker state={state} initialName={displayName} onChoose={(name, seat) => socket.emit("choose_seat", { name, seat })} message={message} />;
   if (me.status === "cashout") return <CashedOut player={me} settlement={state.settlement || []} />;
@@ -80,7 +99,7 @@ function App() {
     localStorage.removeItem(`straddleup:${sessionId}:host`);
     window.location.assign("/");
   };
-  return <PokerTable state={state} me={me} message={message} onAction={(action, amount?) => socket.emit("player_action", { action, amount })} onStart={() => socket.emit("start_hand")} onReady={() => socket.emit("set_ready", { ready: !me.ready })} onRebuy={() => socket.emit("request_rebuy")} onCashout={() => socket.emit("request_cashout")} onApprove={(id) => socket.emit("host_approve_rebuy", { playerId: id })} onRelease={(id) => socket.emit("host_release_disconnected_player", { playerId: id })} onSitOut={(sittingOut) => socket.emit("set_sit_out", { sittingOut })} onStraddle={(enabled) => socket.emit("set_straddle", { enabled })} onTimeBank={() => socket.emit("use_time_bank")} onProposeExtension={(minutes) => socket.emit("propose_time_extension", { minutes })} onVoteExtension={(approve) => socket.emit("vote_time_extension", { approve })} onChat={(text) => socket.emit("send_chat", { text })} onReaction={(reaction) => socket.emit("send_reaction", { reaction })} onHistory={history} onClose={close} />;
+  return <PokerTable state={state} me={me} message={message} clockOffset={clockOffset} onAction={(action, amount?) => socket.emit("player_action", { action, amount })} onStart={() => socket.emit("start_hand")} onReady={() => socket.emit("set_ready", { ready: !me.ready })} onRebuy={() => socket.emit("request_rebuy")} onCashout={() => socket.emit("request_cashout")} onApprove={(id) => socket.emit("host_approve_rebuy", { playerId: id })} onRelease={(id) => socket.emit("host_release_disconnected_player", { playerId: id })} onSitOut={(sittingOut) => socket.emit("set_sit_out", { sittingOut })} onStraddle={(enabled) => socket.emit("set_straddle", { enabled })} onTimeBank={() => socket.emit("use_time_bank")} onProposeExtension={(minutes) => socket.emit("propose_time_extension", { minutes })} onVoteExtension={(approve) => socket.emit("vote_time_extension", { approve })} onChat={(text) => socket.emit("send_chat", { text })} onReaction={(reaction) => socket.emit("send_reaction", { reaction })} onHistory={history} onClose={close} />;
 }
 
 type HostTable = { sessionId: string; status: string; createdAt: string; updatedAt: string; config: { smallBlind: number; bigBlind: number; buyIn: number }; handNumber: number; players: { id: string; name: string; status: string; connected: boolean }[] };
@@ -183,7 +202,7 @@ function CashedOut({ player, settlement }: { player: Player; settlement: { playe
   return <main className="landing"><section className="panel join"><p className="eyebrow">CASHED OUT</p><h2>{player.name}, you’re out of the game.</h2><p className="muted">Your chips are recorded for the final settlement. You can keep this tab open to see the final balance.</p>{result && <div className="settlement-card"><span>Chips out <strong>{result.chipsOut}</strong></span><span>Net <strong className={result.net >= 0 ? "positive" : "negative"}>{result.net >= 0 ? "+" : ""}{result.net}</strong></span></div>}</section></main>;
 }
 
-function PokerTable({ state, me, message, onAction, onStart, onReady, onRebuy, onCashout, onApprove, onRelease, onSitOut, onStraddle, onTimeBank, onProposeExtension, onVoteExtension, onChat, onReaction, onHistory, onClose }: { state: TableState; me: Player; message: string; onAction: (action: string, amount?: number) => void; onStart: () => void; onReady: () => void; onRebuy: () => void; onCashout: () => void; onApprove: (id: string) => void; onRelease: (id: string) => void; onSitOut: (sittingOut: boolean) => void; onStraddle: (enabled: boolean) => void; onTimeBank: () => void; onProposeExtension: (minutes: number) => void; onVoteExtension: (approve: boolean) => void; onChat: (text: string) => void; onReaction: (reaction: string) => void; onHistory: () => Promise<{ kind: string; payload: any; at: string }[]>; onClose: () => Promise<void> }) {
+function PokerTable({ state, me, message, clockOffset, onAction, onStart, onReady, onRebuy, onCashout, onApprove, onRelease, onSitOut, onStraddle, onTimeBank, onProposeExtension, onVoteExtension, onChat, onReaction, onHistory, onClose }: { state: TableState; me: Player; message: string; clockOffset: number; onAction: (action: string, amount?: number) => void; onStart: () => void; onReady: () => void; onRebuy: () => void; onCashout: () => void; onApprove: (id: string) => void; onRelease: (id: string) => void; onSitOut: (sittingOut: boolean) => void; onStraddle: (enabled: boolean) => void; onTimeBank: () => void; onProposeExtension: (minutes: number) => void; onVoteExtension: (approve: boolean) => void; onChat: (text: string) => void; onReaction: (reaction: string) => void; onHistory: () => Promise<{ kind: string; payload: any; at: string }[]>; onClose: () => Promise<void> }) {
   const [raiseTo, setRaiseTo] = useState(0);
   const [remaining, setRemaining] = useState(0);
   const [nextHandRemaining, setNextHandRemaining] = useState(0);
@@ -192,7 +211,9 @@ function PokerTable({ state, me, message, onAction, onStart, onReady, onRebuy, o
   const [sessionRemaining, setSessionRemaining] = useState(0);
   const [stackMode, setStackMode] = useState<"amount" | "blinds">(() => localStorage.getItem("straddleup:stack-mode") === "blinds" ? "blinds" : "amount");
   const timerToneRef = useRef("");
-  useEffect(() => { const tick = () => { const now = Date.now(); setRemaining(Math.max(0, Math.ceil(((state.turnDeadline || 0) - now) / 1000))); setNextHandRemaining(Math.max(0, Math.ceil(((state.nextHandAt || 0) - now) / 1000))); setSessionRemaining(Math.max(0, Math.ceil(((state.sessionEndsAt || 0) - now) / 1000))); }; tick(); const id = window.setInterval(tick, 250); return () => clearInterval(id); }, [state.turnDeadline, state.nextHandAt, state.sessionEndsAt]);
+  // Correct every countdown with the server-time offset so deadlines track the server despite
+  // client clock drift (turnDeadline/nextHandAt/sessionEndsAt are all server epoch-ms).
+  useEffect(() => { const tick = () => { const now = Date.now() + clockOffset; setRemaining(Math.max(0, Math.ceil(((state.turnDeadline || 0) - now) / 1000))); setNextHandRemaining(Math.max(0, Math.ceil(((state.nextHandAt || 0) - now) / 1000))); setSessionRemaining(Math.max(0, Math.ceil(((state.sessionEndsAt || 0) - now) / 1000))); }; tick(); const id = window.setInterval(tick, 250); return () => clearInterval(id); }, [state.turnDeadline, state.nextHandAt, state.sessionEndsAt, clockOffset]);
   useEffect(() => { setRaiseTo(state.legalActions?.minRaiseTo || 0); }, [state.legalActions?.minRaiseTo]);
   useEffect(() => { if (state.status === "running" && state.hand?.actorSeat === me.seat) playTone(660); }, [state.status, state.hand?.actorSeat, state.hand?.actions?.length, me.seat]);
   useEffect(() => {
