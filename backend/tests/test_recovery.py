@@ -72,8 +72,14 @@ async def test_rehydrated_session_timer_can_auto_fold_the_expired_actor():
 
 
 async def test_closed_sessions_are_not_rehydrated():
-    session_id = await _create_running_session()
-    await main.service.close(session_id)
+    # Close a table that is NOT mid-hand so it closes immediately. (When a hand is running,
+    # close() defers to endAfterHand and the session legitimately stays live until the hand ends.)
+    main.init_database()
+    state, _ = await main.service.create(dict(CONFIG), "table-pass")
+    session_id = state["sessionId"]
+    main.seat_player(state, "player0", "Player 0", 0)
+    closed_immediately = not await main.service.close(session_id)
+    assert closed_immediately and state["status"] == "closed"
     main.service.states = {}
 
     await main.service.load_active_sessions()

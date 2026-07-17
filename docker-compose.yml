@@ -30,6 +30,7 @@ services:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-straddleup}:${POSTGRES_PASSWORD:-straddleup}@postgres:5432/${POSTGRES_DB:-straddleup}
       REDIS_URL: redis://redis:6379/0
       APP_SECRET: ${APP_SECRET:-change-me-before-sharing}
+      HOST_ACCESS_CODE: ${HOST_ACCESS_CODE:-}
     depends_on:
       postgres:
         condition: service_healthy

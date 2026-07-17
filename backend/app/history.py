@@ -1,4 +1,7 @@
+from copy import deepcopy
 from typing import Any
+
+from .game import winner_hand_details
 
 
 def completed_hand_payload(state: dict[str, Any]) -> dict[str, Any]:
@@ -23,3 +26,13 @@ def completed_hand_payload(state: dict[str, Any]) -> dict[str, Any]:
             if player.get("handContribution", 0) > 0 or player.get("inHand")
         ],
     }
+
+
+def audit_hand_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Add modern winner descriptions while preserving immutable legacy events."""
+    audit = deepcopy(payload)
+    result = audit.get("result") or {}
+    for pot in result.get("pots", []):
+        if not pot.get("winnerHands"):
+            pot["winnerHands"] = winner_hand_details(audit.get("board", []), audit.get("players", []), pot.get("winners", []))
+    return audit

@@ -28,6 +28,13 @@ class GameSession(Base):
     events: Mapped[list["GameEvent"]] = relationship(back_populates="session", cascade="all, delete-orphan")
 
 
+class HostAdmin(Base):
+    __tablename__ = "host_admin"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    access_code_hash: Mapped[str] = mapped_column(String(256), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 class GameEvent(Base):
     __tablename__ = "game_events"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -40,4 +47,3 @@ class GameEvent(Base):
 
 def init_database() -> None:
     Base.metadata.create_all(bind=engine)
-
