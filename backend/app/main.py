@@ -13,10 +13,11 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from .database import GameEvent, GameSession, SessionLocal, init_database
-from .game import (GameError, act, approve_rebuy, auto_start_next_hand, new_state, player_by_id, public_view,
-                   request_cashout, request_rebuy, seat_player, set_ready, start_hand,
-                   timeout_active_player, validate_config)
-from .history import completed_hand_payload
+from .game import (GameError, act, approve_rebuy, auto_start_next_hand, end_session, new_state, player_by_id,
+                   propose_time_extension, public_view, request_cashout, request_rebuy, seat_player, set_ready,
+                   set_sit_out, set_straddle, start_hand, timeout_active_player, use_time_bank,
+                   validate_config, vote_time_extension)
+from .history import audit_hand_payload, completed_hand_payload
 from .security import hash_passcode, issue_token, read_token, verify_passcode
 
 
@@ -27,7 +28,17 @@ class CreateSessionRequest(BaseModel):
     maxSeats: int = Field(default=9, ge=2, le=9)
     timeoutSeconds: int = Field(default=60, ge=10, le=300)
     autoNextHandSeconds: int = Field(default=8, ge=3, le=30)
+    sessionMinutes: int = Field(default=180, ge=15, le=720)
+    timeBankSeconds: int = Field(default=60, ge=0, le=300)
     passcode: str = Field(min_length=4, max_length=64)
+
+
+class RecoverHostRequest(BaseModel):
+    passcode: str | None = Field(default=None, min_length=4, max_length=64)
+
+
+class HostAccessRequest(BaseModel):
+    accessCode: str = Field(min_length=8, max_length=128)
 
 
 class GameService:
@@ -61,17 +72,47 @@ class GameService:
             record = db.get(GameSession, session_id)
             if not record:
                 raise GameError("This table no longer exists.")
-            self.states[session_id] = record.game_state
-            return record.game_state
+            state = record.game_state
+            # Older builds allowed a player to buy into the table while a hand
+            # was already running. Their chips were not part of that hand's
+            # accounting baseline, which could stop the timeout loop forever.
+            # Reconcile only players absent from the hand's starting snapshot.
+            hand = state.get("hand") or {}
+            starting = hand.get("startingStacks", {})
+            if state.get("status") == "running" and starting and "initialChipTotal" in hand:
+                late_joiner_chips = sum(player.get("stack", 0) for player in state.get("players", []) if player.get("id") not in starting)
+                observed = sum(player.get("stack", 0) for player in state.get("players", [])) + sum(player.get("handContribution", 0) for player in state.get("players", []))
+                if late_joiner_chips and observed == hand["initialChipTotal"] + late_joiner_chips:
+                    hand["initialChipTotal"] = observed
+            self.states[session_id] = state
+            return state
 
     async def passcode_ok(self, session_id: str, passcode: str) -> bool:
         with SessionLocal() as db:
             record = db.get(GameSession, session_id)
             return bool(record and verify_passcode(passcode, record.passcode_hash))
 
+    async def recover_host(self, session_id: str, passcode: str | None = None) -> tuple[str, str]:
+        if passcode and not await self.passcode_ok(session_id, passcode):
+            raise GameError("Incorrect room passcode.")
+        token = issue_token({"kind": "host", "session": session_id}, expires_in=86_400)
+        invite_passcode = passcode or secrets.token_urlsafe(6)
+        with SessionLocal() as db:
+            record = db.get(GameSession, session_id)
+            if not record or record.status == "closed":
+                raise GameError("This table has ended.")
+            record.host_token_hash = hashlib.sha256(token.encode()).hexdigest()
+            record.passcode_hash = hash_passcode(invite_passcode)
+            db.commit()
+        return token, invite_passcode
+
     async def is_host(self, session_id: str, token: str | None) -> bool:
         payload = read_token(token or "")
-        if not payload or payload.get("kind") != "host" or payload.get("session") != session_id:
+        if not payload:
+            return False
+        if payload.get("kind") == "host_admin":
+            return is_host_admin_token(token)
+        if payload.get("kind") != "host" or payload.get("session") != session_id:
             return False
         with SessionLocal() as db:
             record = db.get(GameSession, session_id)
@@ -100,11 +141,11 @@ class GameService:
             record = db.query(GameSession).filter(GameSession.status.in_(["lobby", "running", "complete"])).order_by(GameSession.created_at.desc()).first()
             return record.id if record else None
 
-    async def close(self, session_id: str) -> None:
+    async def close(self, session_id: str) -> bool:
         state = await self.get(session_id)
-        state["status"] = "closed"
-        state["version"] += 1
-        await self.save(session_id, "session_closed", {})
+        queued = end_session(state)
+        await self.save(session_id, "session_end_requested" if queued else "session_closed", {"settlement": state.get("settlement", [])})
+        return queued
 
     async def _cache(self, session_id: str, state: dict) -> None:
         if self.redis:
@@ -135,6 +176,25 @@ def require_host(sid: str) -> dict:
     return context
 
 
+def is_host_admin_token(token: str | None) -> bool:
+    payload = read_token(token or "")
+    return bool(host_access_code()) and bool(payload) and payload.get("kind") == "host_admin"
+
+
+def host_access_code() -> str:
+    """The host credential is supplied only by the ignored local environment file."""
+    return os.getenv("HOST_ACCESS_CODE", "")
+
+
+def require_host_admin(token: str | None) -> None:
+    if not is_host_admin_token(token):
+        raise HTTPException(status_code=401, detail="Host access is required.")
+
+
+def issue_host_admin_token() -> str:
+    return issue_token({"kind": "host_admin"}, expires_in=7 * 24 * 60 * 60)
+
+
 @api.on_event("startup")
 async def startup() -> None:
     init_database()
@@ -156,16 +216,100 @@ async def current_session() -> dict:
     return {"sessionId": await service.current_session_id()}
 
 
+@api.get("/api/host/status")
+async def host_status() -> dict:
+    return {"configured": bool(host_access_code())}
+
+
+@api.post("/api/host/login")
+async def host_login(request: HostAccessRequest) -> dict:
+    configured_code = host_access_code()
+    if not configured_code:
+        raise HTTPException(status_code=503, detail="Host access is not configured on this server.")
+    if not secrets.compare_digest(request.accessCode, configured_code):
+        raise HTTPException(status_code=401, detail="Incorrect host access code.")
+    return {"hostToken": issue_host_admin_token()}
+
+
+@api.get("/api/host/tables")
+async def host_tables(x_host_token: str | None = Header(default=None)) -> dict:
+    require_host_admin(x_host_token)
+    with SessionLocal() as db:
+        records = db.query(GameSession).order_by(GameSession.updated_at.desc()).all()
+        active_tables = []
+        archived_tables = []
+        for record in records:
+            state = record.game_state or {}
+            table = {
+                "sessionId": record.id,
+                "status": record.status,
+                "createdAt": record.created_at.isoformat(),
+                "updatedAt": record.updated_at.isoformat(),
+                "config": record.config,
+                "handNumber": state.get("handNumber", 0),
+                "players": [{"id": player.get("id"), "name": player.get("name"), "status": player.get("status"), "connected": player.get("connected", False)} for player in state.get("players", [])],
+            }
+            (archived_tables if record.status == "closed" else active_tables).append(table)
+    return {"activeTables": active_tables, "archivedTables": archived_tables}
+
+
+@api.get("/api/host/sessions/{session_id}/summary")
+async def host_session_summary(session_id: str, x_host_token: str | None = Header(default=None)) -> dict:
+    require_host_admin(x_host_token)
+    with SessionLocal() as db:
+        record = db.get(GameSession, session_id)
+        if not record:
+            raise HTTPException(status_code=404, detail="That table was not found.")
+        state = record.game_state or {}
+        history_events = db.query(GameEvent).filter(GameEvent.session_id == session_id).order_by(GameEvent.id).all()
+        completed_hands = sum(event.kind == "hand_completed" for event in history_events)
+        return {
+            "sessionId": record.id,
+            "status": record.status,
+            "createdAt": record.created_at.isoformat(),
+            "updatedAt": record.updated_at.isoformat(),
+            "handNumber": state.get("handNumber", 0),
+            "completedHands": completed_hands,
+            "config": record.config,
+            "players": [{"id": player.get("id"), "name": player.get("name"), "status": player.get("status"), "boughtIn": player.get("buyInTotal", 0), "stack": player.get("stack", 0)} for player in state.get("players", [])],
+            "settlement": state.get("settlement", []),
+            "events": [{"kind": event.kind, "payload": audit_hand_payload(event.payload), "at": event.created_at.isoformat()} for event in history_events if event.kind == "hand_completed"],
+        }
+
+
+@api.post("/api/host/sessions/{session_id}/invite")
+async def rotate_invite(session_id: str, x_host_token: str | None = Header(default=None)) -> dict:
+    require_host_admin(x_host_token)
+    invite_passcode = secrets.token_urlsafe(6)
+    with SessionLocal() as db:
+        record = db.get(GameSession, session_id)
+        if not record or record.status == "closed":
+            raise HTTPException(status_code=404, detail="That active table was not found.")
+        record.passcode_hash = hash_passcode(invite_passcode)
+        db.add(GameEvent(session_id=session_id, kind="invite_passcode_rotated", payload={}))
+        db.commit()
+    return {"sessionId": session_id, "invitePasscode": invite_passcode}
+
+
 @api.post("/api/sessions")
-async def create_session(request: CreateSessionRequest) -> dict:
+async def create_session(request: CreateSessionRequest, x_host_token: str | None = Header(default=None)) -> dict:
     try:
-        if await service.current_session_id():
-            raise HTTPException(status_code=409, detail="A private table is already active. Join it or have the host end it first.")
+        require_host_admin(x_host_token)
         config = validate_config(request.model_dump(exclude={"passcode"}))
         state, token = await service.create(config, request.passcode)
         return {"sessionId": state["sessionId"], "hostToken": token}
     except GameError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@api.post("/api/sessions/{session_id}/recover-host")
+async def recover_host(session_id: str, request: RecoverHostRequest, x_host_token: str | None = Header(default=None)) -> dict:
+    try:
+        require_host_admin(x_host_token)
+        token, invite_passcode = await service.recover_host(session_id, request.passcode)
+        return {"hostToken": token, "sessionId": session_id, "invitePasscode": invite_passcode}
+    except GameError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
 
 
 @api.get("/api/sessions/{session_id}/history")
@@ -186,7 +330,7 @@ async def public_session_history(session_id: str, x_player_token: str | None = H
     for event in events:
         if event["kind"] != "hand_completed":
             continue
-        payload = event["payload"]
+        payload = audit_hand_payload(event["payload"])
         public_events.append({
             "kind": event["kind"],
             "at": event["at"],
@@ -205,8 +349,9 @@ async def public_session_history(session_id: str, x_player_token: str | None = H
 async def close_session(session_id: str, x_host_token: str | None = Header(default=None)) -> dict:
     if not await service.is_host(session_id, x_host_token):
         raise HTTPException(status_code=401, detail="Host authorization required.")
-    await service.close(session_id)
-    return {"ok": True}
+    queued = await service.close(session_id)
+    await emit_table(session_id)
+    return {"ok": True, "queued": queued}
 
 
 @sio.event
@@ -313,8 +458,10 @@ async def player_action(sid: str, data: dict) -> None:
         state = await service.get(context["sessionId"])
         act(state, context["playerId"], str(data.get("action")), data.get("amount"))
         await service.save(context["sessionId"], "player_action", {"playerId": context["playerId"], "action": data.get("action"), "amount": data.get("amount")})
-        if state["status"] == "complete":
+        if state["status"] in {"complete", "closed"}:
             await service.save(context["sessionId"], "hand_completed", completed_hand_payload(state))
+            if state["status"] == "closed":
+                await service.save(context["sessionId"], "session_closed", {"settlement": state.get("settlement", [])})
         await emit_table(context["sessionId"])
     except (GameError, KeyError, TypeError, ValueError) as exc:
         await emit_error(sid, str(exc))
@@ -354,6 +501,127 @@ async def cashout(sid: str) -> None:
         await service.save(context["sessionId"], "cashout_requested", {"playerId": context["playerId"], "amount": amount})
         await emit_table(context["sessionId"])
     except (GameError, KeyError) as exc:
+        await emit_error(sid, str(exc))
+
+
+@sio.on("host_release_disconnected_player")
+async def release_disconnected_player(sid: str, data: dict) -> None:
+    try:
+        context = require_host(sid)
+        state = await service.get(context["sessionId"])
+        player = player_by_id(state, str(data.get("playerId", "")))
+        if not player or player.get("status") != "seated" or player.get("connected"):
+            raise GameError("Only a disconnected seated player can be released.")
+        amount = request_cashout(state, player["id"])
+        await service.save(context["sessionId"], "disconnected_player_released", {"playerId": player["id"], "amount": amount})
+        await emit_table(context["sessionId"])
+    except (GameError, KeyError) as exc:
+        await emit_error(sid, str(exc))
+
+
+@sio.on("set_sit_out")
+async def sit_out(sid: str, data: dict) -> None:
+    try:
+        context = contexts[sid]
+        state = await service.get(context["sessionId"])
+        sitting_out = bool(data.get("sittingOut", True))
+        set_sit_out(state, context["playerId"], sitting_out)
+        await service.save(context["sessionId"], "sit_out_changed", {"playerId": context["playerId"], "sittingOut": sitting_out})
+        await emit_table(context["sessionId"])
+    except (GameError, KeyError) as exc:
+        await emit_error(sid, str(exc))
+
+
+@sio.on("set_straddle")
+async def straddle(sid: str, data: dict) -> None:
+    try:
+        context = contexts[sid]
+        state = await service.get(context["sessionId"])
+        enabled = bool(data.get("enabled", True))
+        set_straddle(state, context["playerId"], enabled)
+        await service.save(context["sessionId"], "straddle_changed", {"playerId": context["playerId"], "enabled": enabled})
+        await emit_table(context["sessionId"])
+    except (GameError, KeyError) as exc:
+        await emit_error(sid, str(exc))
+
+
+@sio.on("use_time_bank")
+async def time_bank(sid: str) -> None:
+    try:
+        context = contexts[sid]
+        state = await service.get(context["sessionId"])
+        used = use_time_bank(state, context["playerId"])
+        await service.save(context["sessionId"], "time_bank_used", {"playerId": context["playerId"], "seconds": used})
+        await emit_table(context["sessionId"])
+    except (GameError, KeyError) as exc:
+        await emit_error(sid, str(exc))
+
+
+@sio.on("propose_time_extension")
+async def propose_extension(sid: str, data: dict) -> None:
+    try:
+        context = contexts[sid]
+        state = await service.get(context["sessionId"])
+        minutes = int(data.get("minutes", 30))
+        propose_time_extension(state, context["playerId"], minutes)
+        await service.save(context["sessionId"], "time_extension_proposed", {"playerId": context["playerId"], "minutes": minutes})
+        await emit_table(context["sessionId"])
+    except (GameError, KeyError, TypeError, ValueError) as exc:
+        await emit_error(sid, str(exc))
+
+
+@sio.on("vote_time_extension")
+async def vote_extension(sid: str, data: dict) -> None:
+    try:
+        context = contexts[sid]
+        state = await service.get(context["sessionId"])
+        approve = bool(data.get("approve", False))
+        passed = vote_time_extension(state, context["playerId"], approve)
+        await service.save(context["sessionId"], "time_extension_vote", {"playerId": context["playerId"], "approve": approve, "passed": passed})
+        await emit_table(context["sessionId"])
+    except (GameError, KeyError) as exc:
+        await emit_error(sid, str(exc))
+
+
+@sio.on("send_chat")
+async def send_chat(sid: str, data: dict) -> None:
+    try:
+        context = contexts[sid]
+        state = await service.get(context["sessionId"])
+        player = player_by_id(state, context["playerId"])
+        if not player or player.get("status") != "seated":
+            raise GameError("Choose a seat before chatting.")
+        if state["status"] in {"running", "closed"}:
+            raise GameError("Table chat is paused during a live hand to prevent influencing play.")
+        text = " ".join(str(data.get("text", "")).split())[:240]
+        if not text:
+            raise GameError("Enter a message first.")
+        entry = {"id": secrets.token_urlsafe(6), "playerId": player["id"], "name": player["name"], "text": text, "at": int(__import__("time").time() * 1000)}
+        state.setdefault("chat", []).append(entry)
+        state["chat"] = state["chat"][-100:]
+        await service.save(context["sessionId"], "chat_message", entry)
+        await emit_table(context["sessionId"])
+    except (GameError, KeyError, TypeError) as exc:
+        await emit_error(sid, str(exc))
+
+
+@sio.on("send_reaction")
+async def send_reaction(sid: str, data: dict) -> None:
+    try:
+        context = contexts[sid]
+        state = await service.get(context["sessionId"])
+        player = player_by_id(state, context["playerId"])
+        if not player or player.get("status") != "seated":
+            raise GameError("Choose a seat before reacting.")
+        reaction = str(data.get("reaction", ""))
+        if reaction not in {"👏", "🔥", "😎", "🃏", "♠️", "💰", "GG"}:
+            raise GameError("That reaction is not available at this table.")
+        entry = {"id": secrets.token_urlsafe(6), "playerId": player["id"], "name": player["name"], "text": reaction, "kind": "reaction", "at": int(__import__("time").time() * 1000)}
+        state.setdefault("chat", []).append(entry)
+        state["chat"] = state["chat"][-100:]
+        await service.save(context["sessionId"], "chat_reaction", entry)
+        await emit_table(context["sessionId"])
+    except (GameError, KeyError, TypeError) as exc:
         await emit_error(sid, str(exc))
 
 
